@@ -1,10 +1,13 @@
 package tui
 
 import (
+	"bytes"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"git.bacardi55.io/bacardi55/walgot/internal/api"
@@ -168,13 +171,45 @@ func requestWallabagNbEntries() tea.Msg {
 
 // Callback for requesting entries via API.
 func requestWallabagEntries(nbArticles, nbEntriesPerAPICall int, sortField, sortOrder string) tea.Cmd {
+	cacheFilename := "/tmp/walgot-cache.dat"
+	entries := []wallabago.Item{}
+	// Load cache if present
+	info, err := os.Stat(cacheFilename)
+	if err == nil {
+		if info.Mode()&1<<2 != 0 {
+			// https://stackoverflow.com/questions/45429210/how-do-i-check-a-files-permissions-in-linux-using-go
+			// other users have read permission
+			return func() tea.Msg {
+				return wallabagoResponseErrorMsg{
+					message:        "Error:\n couldn't read cache file for security reasons",
+					wallabagoError: err,
+				}
+			}
+		}
+
+		if content, err := os.ReadFile(cacheFilename); err == nil {
+			err = gob.NewDecoder(bytes.NewBuffer(content)).Decode(&entries)
+			if err != nil {
+				return func() tea.Msg {
+					return wallabagoResponseErrorMsg{
+						message:        "Error:\n couldn't load the entries from cache",
+						wallabagoError: err,
+					}
+				}
+			}
+		}
+	}
+
 	return func() tea.Msg {
+		if len(entries) > 0 {
+			return wallabagoResponseEntitiesMsg(entries)
+		}
 		limitArticleByAPICall := nbEntriesPerAPICall
 		nbCalls := getRequiredNbAPICalls(nbArticles, limitArticleByAPICall)
 
 		// TODO: Move this to async channel?
 		// Might not be a good idea with the ELM architecture?
-		var entries []wallabago.Item
+		// var entries []wallabago.Item
 		for i := 1; i < nbCalls+1; i++ {
 			r, err := api.GetEntries(limitArticleByAPICall, i, sortField, sortOrder)
 
@@ -186,6 +221,27 @@ func requestWallabagEntries(nbArticles, nbEntriesPerAPICall int, sortField, sort
 			}
 
 			entries = append(entries, r.Embedded.Items...)
+		}
+		// TODO cache here, use args for deciding when to cache and when to
+		// return from cache.  Might not be the best position anyways, since
+		// sortField and sortOrder can be provided and may be used for more
+		// specific queries, which would then possibly circumvent the cache,
+		// provided the cache would work for queries without filters set.
+		file, err := os.OpenFile(cacheFilename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+		defer file.Close()
+		if err != nil {
+			msg := "Error:\n couldn't open file to cache Wallabag entries: %s: %s"
+			return wallabagoResponseErrorMsg{
+				message:        fmt.Sprintf(msg, cacheFilename, err),
+				wallabagoError: err,
+			}
+		}
+		err = gob.NewEncoder(file).Encode(entries)
+		if err != nil {
+			return wallabagoResponseErrorMsg{
+				message:        fmt.Sprintf("Error:\n couldn't decode cache file to Wallabag entries slice: %s", err),
+				wallabagoError: err,
+			}
 		}
 
 		return wallabagoResponseEntitiesMsg(entries)
